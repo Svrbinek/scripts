@@ -1,11 +1,26 @@
 #!/bin/bash
 
+# Uchovávejte pouze posledních 1000 řádků logu
+LOG_FILE=~/scripts/logs/create_tasks.log
+if [ -f "$LOG_FILE" ]; then
+  tail -n 1000 "$LOG_FILE" > "${LOG_FILE}.tmp"
+  mv "${LOG_FILE}.tmp" "$LOG_FILE"
+fi
+
 # Nastavení proměnných
 INFLUX_HOST="http://localhost:8087"
 INFLUX_TOKEN="Gu99cq1AGm-NEyowvFEYQJ2FZyLXGuL6zV9Ucmrn-e2L4RE2eXMOViAZmmq9dRrRNZANTUpA5oeT1zIFVCIbPg=="
 INFLUX_ORG="myorg"
 SOURCE_BUCKET="homeassistant"
-DEST_BUCKET="homeassistant_1m"
+
+# Definice agregací
+declare -A AGGREGATIONS=(
+  ["1m"]="homeassistant_1m:1m:homeassistant"
+  ["5m"]="homeassistant_5m:5m:homeassistant_1m"
+  ["10m"]="homeassistant_10m:10m:homeassistant_5m"
+  ["1h"]="homeassistant_1h:1h:homeassistant_10m"
+  ["1d"]="homeassistant_1d:1d:homeassistant_1h"
+)
 
 # Upravená funkce sanitize_measurement bez debug výstupů
 sanitize_measurement() {
@@ -27,6 +42,20 @@ sanitize_measurement() {
   esac
 }
 
+# Funkce pro kontrolu existence tasku
+task_exists() {
+  local task_name="$1"
+  local response=$(curl -s --request GET \
+    "$INFLUX_HOST/api/v2/tasks?name=$task_name&org=$INFLUX_ORG" \
+    --header "Authorization: Token $INFLUX_TOKEN")
+
+  if echo "$response" | grep -q '"name":"'$task_name'"'; then
+    return 0  # Task exists
+  else
+    return 1  # Task does not exist
+  fi
+}
+
 # Načtení seznamu měření z InfluxDB
 echo "Načítám seznam _measurement z bucketu '$SOURCE_BUCKET'..."
 RAW_RESPONSE=$(curl -s --request POST \
@@ -42,27 +71,16 @@ if [[ -z "$RAW_RESPONSE" ]]; then
   exit 1
 fi
 
-# Zobrazení odpovědi pro ladění
-echo "Odpověď z InfluxDB:"
-echo "$RAW_RESPONSE"
-
-# Oprava extrakce měření
+# Extrakce měření
 MEASUREMENTS=$(echo "$RAW_RESPONSE" | awk -F',' '
-  NR > 1 { 
+  NR > 1 {
     if ($4 != "") {
-      # Odstranění mezer a znaků nového řádku
       gsub(/^[ \t]+|[ \t]+$/, "", $4)
       gsub(/[\r\n]/, "", $4)
       if ($4 != "") print $4
     }
   }
 ' | sort -u)
-
-# Debug výpis pro kontrolu
-echo "Debug: Načtená měření (jeden řádek = jedno měření):"
-while IFS= read -r MEASUREMENT; do
-  echo ">> '$MEASUREMENT'"
-done <<< "$MEASUREMENTS"
 
 # Kontrola načtených měření
 if [[ -z "$MEASUREMENTS" ]]; then
@@ -73,25 +91,20 @@ else
   echo "$MEASUREMENTS"
 fi
 
-# Definice agregací
-declare -A AGGREGATIONS=(
-  ["1m"]="homeassistant_1m:1m:homeassistant"
-  ["5m"]="homeassistant_5m:5m:homeassistant_1m"
-  ["10m"]="homeassistant_10m:10m:homeassistant_5m"
-  ["1h"]="homeassistant_1h:1h:homeassistant_10m"
-  ["1d"]="homeassistant_1d:1d:homeassistant_1h"
-)
-
+# Generování a vytváření tasků
 echo "Vytvářím tasky pro agregaci dat..."
 while IFS= read -r MEASUREMENT; do
   for PERIOD in "${!AGGREGATIONS[@]}"; do
     IFS=':' read -r DEST_BUCKET RANGE SOURCE_B <<< "${AGGREGATIONS[$PERIOD]}"
     SANITIZED_MEASUREMENT=$(sanitize_measurement "$MEASUREMENT")
     TASK_NAME="aggregate_${SANITIZED_MEASUREMENT}_${PERIOD}"
-    
-    echo "DEBUG: Vytvářím task '$TASK_NAME'"
-    echo "DEBUG: Měření: '$MEASUREMENT'"
-    
+
+    # Kontrola existence tasku
+    if task_exists "$TASK_NAME"; then
+      echo "Task '$TASK_NAME' již existuje. Přeskakuji."
+      continue
+    fi
+
     FLUX_SCRIPT=$(cat <<EOF
 option task = {name: "${TASK_NAME}", every: ${PERIOD}}
 
@@ -105,11 +118,8 @@ from(bucket: "${SOURCE_B}")
 EOF
     )
 
-    echo "DEBUG: Flux script:"
-    echo "$FLUX_SCRIPT"
-
     # Vytvoření tasku v InfluxDB
-    RESPONSE=$(curl -v --request POST \
+    RESPONSE=$(curl -s --request POST \
       "$INFLUX_HOST/api/v2/tasks" \
       --header "Authorization: Token $INFLUX_TOKEN" \
       --header "Content-Type: application/json" \
@@ -121,25 +131,21 @@ EOF
 EOF
     )
 
-    echo "DEBUG: InfluxDB API Response:"
-    echo "$RESPONSE" | jq '.'
-
-    # Kontrola vytvoření tasku
     if echo "$RESPONSE" | grep -q '"status":"active"'; then
-      echo "Task '${TASK_NAME}' úspěšně vytvořen a je aktivní."
+      echo "Task '${TASK_NAME}' úspěšně vytvořen."
     elif echo "$RESPONSE" | grep -q '"code":"conflict"'; then
       echo "Task '${TASK_NAME}' již existuje."
     else
       echo "CHYBA při vytváření tasku '${TASK_NAME}':"
       echo "$RESPONSE"
-      exit 1
     fi
   done
 done <<< "$MEASUREMENTS"
 
-# Ověření existence tasků
+# Ovněření existence tasků
+echo "Existující tasky:"
 curl -s --request GET \
   "$INFLUX_HOST/api/v2/tasks" \
   --header "Authorization: Token $INFLUX_TOKEN" | jq '.tasks[].name'
 
-echo "Všechny tasky byly vytvořeny!"
+echo "Všechny tasky byly úspěšně vytvořeny!"
